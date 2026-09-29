@@ -404,6 +404,173 @@ describe('parsers', function () {
         assert.strictEqual(errCount, 1)
       })
 
+      function getNestingDepth (reply) {
+        let depth = 0
+        while (Array.isArray(reply)) {
+          assert.strictEqual(reply.length, 1)
+          reply = reply[0]
+          depth++
+        }
+        assert.strictEqual(reply, 1)
+        return depth
+      }
+
+      function checkDepthError (err) {
+        assert(err instanceof ParserError)
+        assert.strictEqual(err.name, 'ParserError')
+        assert.strictEqual(err.message, 'Protocol error, nested arrays exceed the maximum depth of 1000')
+      }
+
+      it('return a fatal error for too deeply nested arrays', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, ['OK'])
+          replyCount++
+        }
+        function checkError (err) {
+          checkDepthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // Every nesting level recurses into the parser. Without a depth limit
+        // this throws "RangeError: Maximum call stack size exceeded".
+        parser.execute(Buffer.from('*1\r\n'.repeat(20000) + ':1\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(replyCount, 0)
+        assert.strictEqual(parser.arrayCache.length, 0)
+        // The parser is reset and keeps working
+        parser.execute(Buffer.from('*1\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+        assert.strictEqual(errCount, 1)
+      })
+
+      it('return a fatal error for too deeply nested arrays received in chunks', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkError (err) {
+          checkDepthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnFatalError: checkError
+        })
+        // Resuming the cached arrays recurses once per nesting level. Without a
+        // depth limit the cache keeps growing until the stack overflows.
+        const chunk = Buffer.from('*1\r\n'.repeat(1000))
+        let maxCached = 0
+        for (let i = 0; i < 40; i++) {
+          parser.execute(chunk)
+          maxCached = Math.max(maxCached, parser.arrayCache.length)
+        }
+        assert.strictEqual(maxCached, 1000)
+        assert.strictEqual(errCount, 20)
+        assert.strictEqual(parser.arrayCache.length, 0)
+      })
+
+      it('parse nested arrays up to the maximum depth', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.strictEqual(getNestingDepth(reply), 1000)
+          replyCount++
+        }
+        function checkError (err) {
+          checkDepthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        parser.execute(Buffer.from('*1\r\n'.repeat(1000) + ':1\r\n'))
+        assert.strictEqual(replyCount, 1)
+        parser.execute(Buffer.from('*1\r\n'.repeat(1001) + ':1\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(replyCount, 1)
+
+        // The depth is tracked across chunks
+        const chunk = Buffer.from('*1\r\n'.repeat(100))
+        for (let i = 0; i < 10; i++) {
+          parser.execute(chunk)
+        }
+        assert.strictEqual(errCount, 1)
+        parser.execute(Buffer.from(':1\r\n'))
+        assert.strictEqual(replyCount, 2)
+        for (let i = 0; i < 10; i++) {
+          parser.execute(chunk)
+        }
+        assert.strictEqual(errCount, 1)
+        parser.execute(Buffer.from('*1\r\n:1\r\n'))
+        assert.strictEqual(errCount, 2)
+        assert.strictEqual(replyCount, 2)
+        assert.strictEqual(parser.arrayCache.length, 0)
+        parser.execute(Buffer.from('*1\r\n'.repeat(1000) + ':1\r\n'))
+        assert.strictEqual(replyCount, 3)
+        assert.strictEqual(errCount, 2)
+      })
+
+      it('reset the nesting depth if returnFatalError throws', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        function checkReply (reply) {
+          assert.strictEqual(getNestingDepth(reply), 1000)
+          replyCount++
+        }
+        const parser = newParser(checkReply)
+        assert.throws(function () {
+          parser.execute(Buffer.from('*1\r\n'.repeat(1001) + ':1\r\n'))
+        }, function (err) {
+          checkDepthError(err)
+          return true
+        })
+        assert.strictEqual(parser.arrayCache.length, 0)
+        parser.execute(Buffer.from('*1\r\n'.repeat(1000) + ':1\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
+      it('do not keep partially parsed arrays after a fatal error', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, ['OK', 'OK2'])
+          replyCount++
+        }
+        function checkError (err) {
+          assert(err instanceof ParserError)
+          assert.strictEqual(err.message, 'Protocol error, got "x" as reply type byte')
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // A protocol error inside nested arrays must not leave the partial
+        // arrays behind. Otherwise they pile up with every fatal error and
+        // resuming the next chunked array recurses through all of them.
+        const chunk = Buffer.from('*1\r\n'.repeat(999) + 'x')
+        for (let i = 0; i < 50; i++) {
+          parser.execute(chunk)
+        }
+        assert.strictEqual(errCount, 50)
+        parser.execute(Buffer.from('*2\r\n+OK\r\n'))
+        parser.execute(Buffer.from('+OK2\r\n'))
+        assert.strictEqual(replyCount, 1)
+        assert.strictEqual(parser.arrayCache.length, 0)
+      })
+
       it('should handle \\r and \\n characters properly', function () {
         // If a string contains \r or \n characters it will always be send as a bulk string
         const entries = ['foo\r', 'foo\r\nbar', '\r\nСанкт-Пет', 'foo\r\n', 'foo', 'foobar', 'foo\r', 'äfooöü', 'abc']
