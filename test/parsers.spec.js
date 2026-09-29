@@ -571,6 +571,150 @@ describe('parsers', function () {
         assert.strictEqual(parser.arrayCache.length, 0)
       })
 
+      function checkLengthError (err) {
+        assert(err instanceof ParserError)
+        assert.strictEqual(err.name, 'ParserError')
+        assert.strictEqual(err.message, 'Protocol error, array length exceeds the maximum of 4294967295')
+      }
+
+      it('return a fatal error for an array length above the maximum', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, ['OK'])
+          replyCount++
+        }
+        function checkError (err) {
+          checkLengthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // Without a length limit `new Array(length)` throws
+        // "RangeError: Invalid array length" and crashes the client.
+        parser.execute(Buffer.from('*4294967296\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(replyCount, 0)
+        parser.execute(Buffer.from('*99999999999999999999\r\n+OK\r\n'))
+        assert.strictEqual(errCount, 2)
+        assert.strictEqual(replyCount, 0)
+        // The parser is reset and keeps working
+        parser.execute(Buffer.from('*1\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+        assert.strictEqual(errCount, 2)
+      })
+
+      it('return a fatal error for a nested array length above the maximum', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [['OK'], 1])
+          replyCount++
+        }
+        function checkError (err) {
+          checkLengthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        parser.execute(Buffer.from('*2\r\n+OK\r\n*1\r\n*4294967296\r\n+OK\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(replyCount, 0)
+        assert.strictEqual(parser.arrayCache.length, 0)
+        // The partly parsed arrays are dropped and the parser keeps working
+        parser.execute(Buffer.from('*2\r\n*1\r\n+OK\r\n:1\r\n'))
+        assert.strictEqual(replyCount, 1)
+        assert.strictEqual(errCount, 1)
+      })
+
+      it('return a fatal error for an array length above the maximum received in chunks', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkReply (reply) {
+          assert.deepEqual(reply, [['OK'], 1])
+          replyCount++
+        }
+        function checkError (err) {
+          checkLengthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnReply: checkReply,
+          returnFatalError: checkError
+        })
+        // The oversized length is parsed while resuming the cached arrays
+        parser.execute(Buffer.from('*2\r\n*2\r\n+OK\r\n'))
+        assert.strictEqual(parser.arrayCache.length, 2)
+        parser.execute(Buffer.from('*42949'))
+        parser.execute(Buffer.from('67296\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(replyCount, 0)
+        assert.strictEqual(parser.arrayCache.length, 0)
+        // The same happens if the array is resumed after a chunked bulk string
+        parser.execute(Buffer.from('*2\r\n$2\r\nO'))
+        parser.execute(Buffer.from('K\r\n*4294967296\r\n'))
+        assert.strictEqual(errCount, 2)
+        assert.strictEqual(replyCount, 0)
+        assert.strictEqual(parser.arrayCache.length, 0)
+        parser.execute(Buffer.from('*2\r\n*1\r\n+O'))
+        parser.execute(Buffer.from('K\r\n:1\r\n'))
+        assert.strictEqual(replyCount, 1)
+        assert.strictEqual(errCount, 2)
+      })
+
+      it('parse array lengths up to the maximum', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        let errCount = 0
+        function checkError (err) {
+          checkLengthError(err)
+          errCount++
+        }
+        const parser = newParser({
+          returnFatalError: checkError
+        })
+        // The maximum array length is accepted and waits for more data
+        parser.execute(Buffer.from('*4294967295\r\n+OK\r\n'))
+        assert.strictEqual(errCount, 0)
+        assert.strictEqual(parser.arrayCache.length, 1)
+        assert.strictEqual(parser.arrayCache[0].length, 4294967295)
+        assert.strictEqual(parser.arrayPos[0], 1)
+        parser.execute(Buffer.from('*4294967296\r\n'))
+        assert.strictEqual(errCount, 1)
+        assert.strictEqual(parser.arrayCache.length, 0)
+      })
+
+      it('throw a parser error for an array length above the maximum with the default returnFatalError', function () {
+        if (Parser.name === 'HiredisReplyParser') {
+          return this.skip()
+        }
+        function checkReply (reply) {
+          assert.deepEqual(reply, ['OK'])
+          replyCount++
+        }
+        const parser = newParser(checkReply)
+        assert.throws(function () {
+          parser.execute(Buffer.from('*1\r\n*4294967296\r\n'))
+        }, function (err) {
+          checkLengthError(err)
+          return true
+        })
+        assert.strictEqual(parser.arrayCache.length, 0)
+        parser.execute(Buffer.from('*1\r\n+OK\r\n'))
+        assert.strictEqual(replyCount, 1)
+      })
+
       it('should handle \\r and \\n characters properly', function () {
         // If a string contains \r or \n characters it will always be send as a bulk string
         const entries = ['foo\r', 'foo\r\nbar', '\r\nСанкт-Пет', 'foo\r\n', 'foo', 'foobar', 'foo\r', 'äfooöü', 'abc']
